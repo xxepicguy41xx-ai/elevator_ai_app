@@ -1,0 +1,8 @@
+streamlit
+faiss-cpu
+sentence-transformers
+pymupdf
+beautifulsoup4
+html5lib
+groq
+python-dotenv
