@@ -2,28 +2,25 @@ import os
 import json
 import numpy as np
 import faiss
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
-# ========= Fast loads (module level = loaded once per process) =========
-# Preload data
+# ========= Load data once =========
 chunks = json.load(open("chunks.json", "r", encoding="utf-8"))
 sources = json.load(open("sources.json", "r", encoding="utf-8"))
 
-# Preload FAISS index
 index = faiss.read_index("faiss_index.index")
 
-# Preload encoder (SentenceTransformer can be slow to import; load lazily)
-# We import here, but instantiate on first use to avoid slow cold starts.
+# Lazy encoder load (speeds up cold start)
 _model = None
 def get_encoder():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        # TIP: switch to "all-MiniLM-L6-v2" for much faster queries with small hit to recall.
         _model = SentenceTransformer("hkunlp/instructor-base")
+        # For speed, you can switch to: "all-MiniLM-L6-v2"
     return _model
 
-# Optional Cross-Encoder reranker (instantiated only if used)
+# Optional reranker (only instantiated if requested)
 _reranker = None
 def get_reranker():
     global _reranker
@@ -32,7 +29,7 @@ def get_reranker():
         _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     return _reranker
 
-# ========= Brand/type inference (lightweight) =========
+# ========= Brand/type inference =========
 BRANDS = ["otis","kone","thyssen","thyssenkrupp","tke","schindler","dover","mce","smartrise","gal","nidec","magnetek"]
 TYPES  = ["hydraulic","traction","machine_room_less","mrl","gearless","geared"]
 
@@ -67,12 +64,11 @@ def _filter_mask(indices: np.ndarray, brand: Optional[str], etype: Optional[str]
     for i in indices:
         meta = sources[int(i)]
         ok = True
-        if brand  and meta["brand"] != brand: ok = False
-        if etype  and meta["etype"] != etype: ok = False
+        if brand and meta["brand"] != brand: ok = False
+        if etype and meta["etype"] != etype: ok = False
         mask.append(ok)
     return np.array(mask, dtype=bool)
 
-# ========= Fast search with optional rerank =========
 def search_chunks(
     query: str,
     k: int = 3,
@@ -80,20 +76,20 @@ def search_chunks(
     brand: Optional[str] = None,
     etype: Optional[str] = None,
     use_reranker: bool = False
-) -> List[Tuple[str, dict]]:
+) -> List[int]:
     enc = get_encoder()
     qv = enc.encode([query])
     D, I = index.search(np.array(qv).reshape(1, -1), pool)
     cand = I[0]
 
-    # filter by metadata first (cheap)
+    # cheap filter first
     if brand or etype:
         mask = _filter_mask(cand, brand, etype)
         filtered = cand[mask]
-        if len(filtered) >= max(k, 5):  # keep some headroom
+        if len(filtered) >= max(k, 5):
             cand = filtered
 
-    # optional rerank (only over the small candidate list)
+    # rerank if needed
     if use_reranker:
         reranker = get_reranker()
         pairs = [(query, chunks[int(i)]) for i in cand]
@@ -101,9 +97,8 @@ def search_chunks(
         order = np.argsort(-scores)
         cand = cand[order]
 
-    # pick top-k, prefer not to overspread manuals if brand/type chosen
     picked = []
-    seen = set()
+    seen_manuals = set()
     for i in cand:
         meta = sources[int(i)]
         if brand and meta["brand"] != brand: 
@@ -111,14 +106,14 @@ def search_chunks(
         if etype and meta["etype"] != etype:
             continue
         key = meta["manual"]
-        if key in seen and len(seen) < 2:
+        if key in seen_manuals and len(seen_manuals) < 2:
             pass
         picked.append(int(i))
-        seen.add(key)
+        seen_manuals.add(key)
         if len(picked) == k:
             break
 
-    # backfill if strict filter yields too few
+    # backfill if strict filter too narrow
     if len(picked) < k:
         for i in cand:
             ii = int(i)
@@ -127,12 +122,23 @@ def search_chunks(
             if len(picked) == k:
                 break
 
-    return [(chunks[i], sources[i]) for i in picked]
+    return picked
 
-# ========= Answer with Groq =========
+# Optional base URL to make manual links clickable (e.g., a public S3/SharePoint dir)
+BASE_DOC_URL = os.environ.get("BASE_DOC_URL", "").rstrip("/")
+
+def format_source(meta: Dict) -> str:
+    # If you have hosted PDFs, make them clickable
+    manual = meta["manual"]
+    page = meta.get("page", "?")
+    if BASE_DOC_URL and manual.lower().endswith(".pdf"):
+        link = f"{BASE_DOC_URL}/{manual}#page={page}"
+        return f"[{manual} — p.{page}]({link})"
+    return f"{manual} — p.{page}"
+
+# ======== Groq client ========
 from groq import Groq
 def get_client():
-    # Prefer Streamlit secrets if available, else env
     api_key = os.getenv("GROQ_API_KEY")
     return Groq(api_key=api_key)
 
@@ -144,20 +150,22 @@ def ask_groq(
     pool: int = 30,
     use_reranker: bool = False,
     temperature: float = 0.1
-) -> str:
-    context_chunks = search_chunks(
-        query, k=k, pool=pool, brand=brand, etype=etype, use_reranker=use_reranker
-    )
+) -> Tuple[str, List[Dict]]:
+    picked_indices = search_chunks(query, k=k, pool=pool, brand=brand, etype=etype, use_reranker=use_reranker)
+
+    # Build compact context
+    context_lines = []
+    used = []
+    for i in picked_indices:
+        text = chunks[i]
+        meta = sources[i]
+        used.append(meta)
+        context_lines.append(f"{text}\n(Source: {meta['manual']} - Page {meta['page']})")
 
     scope = []
-    if brand: scope.append(f"Brand scope: {brand.upper()}")
+    if brand: scope.append(f"Brand: {brand.upper()}")
     if etype: scope.append(f"Type: {etype.upper()}")
     scope_line = " | ".join(scope) if scope else "Generic scope"
-
-    context = "\n\n".join([
-        f"{text}\n(Source: {meta['manual']} - Page {meta['page']})"
-        for text, meta in context_chunks
-    ])
 
     messages = [
         {
@@ -170,7 +178,9 @@ def ask_groq(
         },
         {
             "role": "user",
-            "content": f"{scope_line}\n\n{context}\n\nQuestion: {query}"
+            "content": f"{scope_line}\n\n" +
+                       "\n\n".join(context_lines) +
+                       f"\n\nQuestion: {query}"
         }
     ]
 
@@ -181,4 +191,5 @@ def ask_groq(
         temperature=temperature,
         max_tokens=500
     )
-    return resp.choices[0].message.content
+    answer = resp.choices[0].message.content.strip()
+    return answer, used
