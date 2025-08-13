@@ -4,141 +4,226 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from groq import Groq
+import logging
 
-# === Load data ===
-chunks = json.load(open("chunks.json", "r", encoding="utf-8"))
-sources = json.load(open("sources.json", "r", encoding="utf-8"))
-embeddings = np.load("embeddings.npy")
-index = faiss.read_index("faiss_index.index")
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# === Load models ===
-model = SentenceTransformer("hkunlp/instructor-base")
-RERANKER = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+# --- Constants for Configuration ---
+# File paths
+CHUNKS_PATH = "chunks.json"
+SOURCES_PATH = "sources.json"
+EMBEDDINGS_PATH = "embeddings.npy"
+FAISS_INDEX_PATH = "faiss_index.index"
 
-# === Brand/type inference ===
-BRANDS = ["otis", "kone", "thyssen", "thyssenkrupp", "tke", "schindler", "dover", "mce", "smartrise", "gal", "nidec", "magnetek"]
-TYPES = ["hydraulic", "traction", "machine_room_less", "mrl", "gearless", "geared"]
+# Model identifiers
+EMBEDDING_MODEL = "hkunlp/instructor-base"
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+GROQ_MODEL = "llama3-70b-8192" # Using a powerful, standard Groq model
 
-def infer_brand(name: str):
-    low = name.lower()
-    for b in BRANDS:
-        if b in low:
-            return "tke" if b in ["thyssenkrupp", "tke", "thyssen"] else b
-    return "unknown"
+# Brand/Type Inference Mappings
+# This makes it easier to manage aliases (e.g., different spellings for Thyssenkrupp)
+BRAND_MAP = {
+    "thyssenkrupp": "tke",
+    "thyssen": "tke",
+    "tke": "tke",
+    "otis": "otis",
+    "kone": "kone",
+    "schindler": "schindler",
+    "dover": "dover",
+    "mce": "mce",
+    "smartrise": "smartrise",
+    "gal": "gal",
+    "nidec": "nidec",
+    "magnetek": "magnetek",
+}
+TYPE_MAP = {
+    "machine_room_less": "mrl",
+    "mrl": "mrl",
+    "trl": "mrl",
+    "hydraulic": "hydraulic",
+    "hyd": "hydraulic",
+    "traction": "traction",
+    "gearless": "gearless",
+    "geared": "geared",
+}
 
-def infer_type(name: str):
-    low = name.lower()
-    for t in TYPES:
-        if t in low.replace("-", "_").replace(" ", "_"):
-            return "mrl" if t == "machine_room_less" else t
-    if "hyd" in low: return "hydraulic"
-    if "trl" in low or "mrl" in low: return "mrl"
-    return "unknown"
+class ElevatorAIPipeline:
+    """
+    Encapsulates the entire RAG pipeline for the Elevator AI assistant.
+    This includes loading data, models, searching, and interacting with the LLM.
+    """
+    def __init__(self):
+        """
+        Initializes the pipeline by loading all necessary models and data.
+        This is a heavy operation and should only be done once.
+        """
+        logging.info("Initializing ElevatorAIPipeline...")
+        try:
+            # --- Load Data ---
+            self.chunks = self._load_json(CHUNKS_PATH, "Chunks")
+            self.sources = self._load_json(SOURCES_PATH, "Sources")
+            self.embeddings = np.load(EMBEDDINGS_PATH)
+            self.index = faiss.read_index(FAISS_INDEX_PATH)
 
-for meta in sources:
-    m = meta["manual"]
-    meta["brand"] = infer_brand(m)
-    meta["etype"] = infer_type(m)
+            # --- Load Models ---
+            self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+            self.reranker = CrossEncoder(RERANKER_MODEL)
 
-ALL_BRANDS = sorted({s["brand"] for s in sources})
-ALL_TYPES = sorted({s["etype"] for s in sources})
+            # --- Configure Groq Client ---
+            api_key = os.environ.get("GROQ_API_KEY")
+            if not api_key:
+                raise ValueError("GROQ_API_KEY environment variable not set.")
+            self.groq_client = Groq(api_key=api_key)
 
-# === Helper: filter mask ===
-def _filter_mask(indices, brand, etype):
-    mask = []
-    for i in indices:
-        meta = sources[i]
-        ok = True
-        if brand and meta["brand"] != brand:
-            ok = False
-        if etype and meta["etype"] != etype:
-            ok = False
-        mask.append(ok)
-    return np.array(mask, dtype=bool)
+            # --- Pre-process Metadata ---
+            # This adds 'brand' and 'etype' to each source for efficient filtering.
+            # In a production environment, this should be a one-time offline process.
+            self._enrich_source_metadata()
+            self.all_brands = sorted({s.get("brand", "unknown") for s in self.sources})
+            self.all_types = sorted({s.get("etype", "unknown") for s in self.sources})
+            logging.info("Pipeline initialized successfully.")
 
-# === Search with brand/type filter + rerank ===
-def search_chunks(query, k=5, pool=50, brand=None, etype=None):
-    qv = model.encode([query])
-    D, I = index.search(np.array(qv).reshape(1, -1), pool)
-    cand_indices = I[0]
+        except Exception as e:
+            logging.error(f"Failed to initialize pipeline: {e}")
+            raise
 
-    if brand or etype:
-        mask = _filter_mask(cand_indices, brand, etype)
-        filtered = cand_indices[mask]
-        if len(filtered) >= k:
-            cand_indices = filtered
+    def _load_json(self, path, name):
+        """Helper to load a JSON file with proper error handling."""
+        logging.info(f"Loading {name} from {path}...")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-    cand_pairs = [(query, chunks[i]) for i in cand_indices]
-    scores = RERANKER.predict(cand_pairs)
-    order = np.argsort(-scores)
+    def _infer_metadata(self, name, mapping):
+        """Generic function to infer a category from a name using a mapping."""
+        lowered_name = name.lower().replace("-", "_").replace(" ", "_")
+        for key, value in mapping.items():
+            if key in lowered_name:
+                return value
+        return "unknown"
 
-    picked = []
-    seen_manuals = set()
-    for idx in order:
-        i = cand_indices[idx]
-        meta = sources[i]
-        if brand and meta["brand"] != brand:
-            continue
-        if etype and meta["etype"] != etype:
-            continue
-        key = meta["manual"]
-        if key in seen_manuals and len(seen_manuals) < 2:
-            pass
-        picked.append(i)
-        seen_manuals.add(key)
-        if len(picked) == k: break
+    def _enrich_source_metadata(self):
+        """
+        Adds 'brand' and 'etype' keys to each source document in-memory.
+        """
+        logging.info("Enriching source metadata with brand and type...")
+        for meta in self.sources:
+            manual_name = meta.get("manual", "")
+            meta["brand"] = self._infer_metadata(manual_name, BRAND_MAP)
+            meta["etype"] = self._infer_metadata(manual_name, TYPE_MAP)
 
-    if len(picked) < k:
-        for idx in order:
-            i = cand_indices[idx]
-            if i not in picked:
-                picked.append(i)
-            if len(picked) == k: break
+    def search_and_rerank(self, query: str, brand: str = None, etype: str = None, k: int = 5, pool: int = 50):
+        """
+        Performs a streamlined search and reranking process.
+        1. Retrieves an initial pool of candidates using FAISS.
+        2. Filters candidates by brand and/or type.
+        3. Reranks the filtered candidates using a CrossEncoder.
+        4. Returns the top 'k' results.
+        """
+        # 1. Initial Retrieval (Vector Search)
+        query_vector = self.embedding_model.encode([query])
+        _, initial_indices = self.index.search(query_vector, pool)
+        candidate_indices = initial_indices[0]
 
-    return [(chunks[i], sources[i]) for i in picked]
+        # 2. Filter by Metadata
+        filtered_indices = []
+        if brand or etype:
+            for i in candidate_indices:
+                meta = self.sources[i]
+                brand_match = not brand or meta.get("brand") == brand
+                etype_match = not etype or meta.get("etype") == etype
+                if brand_match and etype_match:
+                    filtered_indices.append(i)
+        else:
+            # If no filters, all candidates are considered
+            filtered_indices = list(candidate_indices)
 
-# === Groq client ===
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        if not filtered_indices:
+            logging.warning("No documents matched the filter criteria.")
+            return []
 
-# === Ask Groq with scope ===
-def ask_groq(query, brand=None, etype=None):
-    context_chunks = search_chunks(query, k=5, pool=60, brand=brand, etype=etype)
+        # 3. Rerank the Filtered Candidates
+        rerank_pairs = [(query, self.chunks[i]) for i in filtered_indices]
+        scores = self.reranker.predict(rerank_pairs)
+        
+        # Combine indices with their new scores and sort
+        reranked_results = sorted(zip(scores, filtered_indices), key=lambda x: x[0], reverse=True)
 
-    scope = []
-    if brand: scope.append(f"Brand scope: {brand.upper()}")
-    if etype: scope.append(f"Elevator type: {etype.upper()}")
-    scope_line = " | ".join(scope) if scope else "Generic scope"
+        # 4. Select Top K Results
+        final_indices = [idx for score, idx in reranked_results]
+        top_k_indices = final_indices[:k]
 
-    context = "\n\n".join([
-        f"{text}\n(Source: {meta['manual']} - Page {meta['page']})"
-        for text, meta in context_chunks
-    ])
+        return [(self.chunks[i], self.sources[i]) for i in top_k_indices]
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are an expert elevator mechanic assistant. "
-                "Answer ONLY using the provided context. "
-                "Do NOT mix brands; if sources conflict or span multiple brands, prefer the selected brand. "
-                "If insufficient brand-scoped context exists, say so and return the closest relevant match WITH citation."
+    def ask(self, query: str, brand: str = None, etype: str = None):
+        """
+        The main public method to ask a question to the AI assistant.
+        """
+        logging.info(f"Received query: '{query}' with filters Brand='{brand}', Type='{etype}'")
+        
+        # Retrieve context from manuals
+        context_chunks = self.search_and_rerank(query, brand=brand, etype=etype)
+
+        if not context_chunks:
+            return "I couldn't find any relevant information in the manuals for your specific query and filters. Please try rephrasing your question or broadening the scope."
+
+        # Build the context string for the LLM
+        context = "\n\n".join([
+            f"Excerpt from '{meta['manual']}' (Page {meta['page']}):\n> {text}"
+            for text, meta in context_chunks
+        ])
+        
+        # Construct the prompt for the LLM
+        scope_parts = []
+        if brand: scope_parts.append(f"elevator brand: {brand.upper()}")
+        if etype: scope_parts.append(f"elevator type: {etype.upper()}")
+        scope_line = f"You are answering within the following scope: {', '.join(scope_parts)}." if scope_parts else "You are answering a general question."
+
+        system_prompt = (
+            "You are an expert elevator mechanic AI assistant. Your sole purpose is to answer questions based *only* on the provided excerpts from technical manuals. "
+            "Be concise, clear, and direct. Present your answer in a way that a mechanic in the field can quickly understand and use. "
+            "If the provided excerpts are insufficient to answer the question, clearly state that the information is not available in the provided context. "
+            "You must cite the source manual and page number for the information you use, like this: `(Source: [manual_name], Page: [page_number])`."
+        )
+
+        user_prompt = (
+            f"{scope_line}\n\n"
+            "Please use the following manual excerpts to answer the question.\n\n"
+            f"---BEGIN MANUAL EXCERPTS---\n{context}\n---END MANUAL EXCERPTS---\n\n"
+            f"Question: {query}"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        # Call the Groq API
+        try:
+            logging.info("Sending request to Groq API...")
+            response = self.groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=1024
             )
-        },
-        {
-            "role": "user",
-            "content": (
-                f"{scope_line}\n\n"
-                "Use the following manual excerpts to answer. "
-                "Cite the manual file and page.\n\n"
-                f"{context}\n\nQuestion: {query}"
-            )
-        }
-    ]
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"Error calling Groq API: {e}")
+            return "Sorry, I encountered an error while trying to generate an answer. Please try again later."
 
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=messages,
-        temperature=0.1,
-        max_tokens=600
-    )
-    return response.choices[0].message.content
+# --- Singleton Instance ---
+# This creates a single instance of the pipeline that the Streamlit app can import.
+# Streamlit's architecture will cache this module, so the heavy initialization
+# runs only once when the app starts.
+try:
+    ai_pipeline = ElevatorAIPipeline()
+    ALL_BRANDS = ai_pipeline.all_brands
+    ALL_TYPES = ai_pipeline.all_types
+except Exception as e:
+    # If initialization fails, set placeholders to allow the app to load and show an error.
+    ai_pipeline = None
+    ALL_BRANDS = []
+    ALL_TYPES = []
+    logging.critical(f"CRITICAL: AI Pipeline failed to initialize. The app will not be functional. Error: {e}")
+
