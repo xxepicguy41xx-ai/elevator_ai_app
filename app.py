@@ -2,70 +2,64 @@ import os
 import json
 import numpy as np
 import faiss
+import importlib
 import streamlit as st
+import core_ai  # import the module, not just the names
 
-# Import your pipeline
 from core_ai import ai_pipeline, ALL_BRANDS, ALL_TYPES
 
 st.set_page_config(page_title="Elevator AI Assistant", page_icon="🛗", layout="centered")
 st.title("🛗 Elevator Mechanic AI Assistant")
 
-# ---------- Quick diagnostics helper ----------
 def run_diagnostics():
     st.subheader("🔎 Quick Diagnostics")
-    # 1) Secrets / env
-    groq_ok = bool(os.getenv("GROQ_API_KEY"))
-    st.write("GROQ_API_KEY present:", "✅" if groq_ok else "❌")
-
-    # 2) Files present + size
+    st.write("GROQ_API_KEY present:", "✅" if bool(os.getenv("GROQ_API_KEY")) else "❌")
     files = {
         "chunks.json": "text chunks",
         "sources.json": "chunk metadata",
         "embeddings.npy": "vector embeddings",
         "faiss_index.index": "FAISS index",
     }
-    missing = False
     for f, desc in files.items():
         exists = os.path.exists(f)
         size = os.path.getsize(f) if exists else 0
         st.write(f"- **{f}** ({desc}):", "✅" if exists else "❌", f"({size/1024/1024:.2f} MB)")
-        if not exists or size == 0:
-            missing = True
+    try:
+        chunks = json.load(open("chunks.json","r",encoding="utf-8"))
+        sources = json.load(open("sources.json","r",encoding="utf-8"))
+        st.write(f"chunks: {len(chunks)} | sources: {len(sources)}",
+                 "✅" if len(chunks)==len(sources) else "⚠️ mismatch")
+    except Exception as e:
+        st.error(f"JSON read error: {e}")
+    try:
+        emb = np.load("embeddings.npy")
+        st.write("embeddings.npy dtype:", str(emb.dtype))
+        st.write("embeddings.npy shape:", str(emb.shape))
+        idx = faiss.read_index("faiss_index.index")
+        st.write("faiss index dim:", idx.d)
+        st.write("Dimension check:", "✅" if emb.shape[1]==idx.d else f"❌ ({emb.shape[1]} vs {idx.d})")
+    except Exception as e:
+        st.error(f"Embedding/Index check error: {e}")
 
-    if not missing:
-        # 3) JSON lengths
-        try:
-            chunks = json.load(open("chunks.json","r",encoding="utf-8"))
-            sources = json.load(open("sources.json","r",encoding="utf-8"))
-            st.write(f"chunks: {len(chunks)}  |  sources: {len(sources)}", "✅" if len(chunks)==len(sources) else "⚠️ lengths differ")
-        except Exception as e:
-            st.error(f"JSON read error: {e}")
-
-        # 4) Embeddings + FAISS shape check
-        try:
-            emb = np.load("embeddings.npy")
-            st.write("embeddings.npy dtype:", str(emb.dtype))
-            st.write("embeddings.npy shape:", str(emb.shape))
-            try:
-                idx = faiss.read_index("faiss_index.index")
-                st.write("faiss index dim:", idx.d)
-                if emb.shape[1] != idx.d:
-                    st.error(f"Dimension mismatch: embeddings dim {emb.shape[1]} vs index dim {idx.d}")
-                else:
-                    st.write("Dimension check:", "✅")
-            except Exception as e:
-                st.error(f"FAISS index read error: {e}")
-        except Exception as e:
-            st.error(f"Embeddings load error: {e}")
-
-# ---------- Main ----------
+# ---------- If core failed ----------
 if not ai_pipeline:
     st.error(
         "**Fatal Error:** The AI core failed to initialize. "
-        "This is likely due to a missing model, data file, or API key."
+        "This is usually a model download issue (like the CrossEncoder)."
     )
-    if st.button("Run quick diagnostics"):
-        run_diagnostics()
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Run quick diagnostics"):
+            run_diagnostics()
+    with colB:
+        if st.button("🔄 Reload AI core"):
+            importlib.reload(core_ai)
+            from core_ai import ai_pipeline as _ai, ALL_BRANDS as _B, ALL_TYPES as _T
+            # overwrite globals so the rest of the app sees the fresh core
+            globals()["ai_pipeline"] = _ai
+            globals()["ALL_BRANDS"] = _B
+            globals()["ALL_TYPES"] = _T
+            st.rerun()
 else:
     st.markdown(
         "Ask a technical question about an elevator system. "
