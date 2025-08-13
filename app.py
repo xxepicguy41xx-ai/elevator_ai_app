@@ -1,68 +1,95 @@
+import os
+import json
+import numpy as np
+import faiss
 import streamlit as st
-# We import the initialized pipeline instance and constants from our core AI module.
-# Renaming ask_ai.py to core_ai.py is recommended for clarity.
+
+# Import your pipeline
 from core_ai import ai_pipeline, ALL_BRANDS, ALL_TYPES
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Elevator AI Assistant",
-    page_icon="🛗",
-    layout="centered"
-)
-
-# --- Main UI ---
+st.set_page_config(page_title="Elevator AI Assistant", page_icon="🛗", layout="centered")
 st.title("🛗 Elevator Mechanic AI Assistant")
 
-# Check if the AI pipeline loaded correctly.
+# ---------- Quick diagnostics helper ----------
+def run_diagnostics():
+    st.subheader("🔎 Quick Diagnostics")
+    # 1) Secrets / env
+    groq_ok = bool(os.getenv("GROQ_API_KEY"))
+    st.write("GROQ_API_KEY present:", "✅" if groq_ok else "❌")
+
+    # 2) Files present + size
+    files = {
+        "chunks.json": "text chunks",
+        "sources.json": "chunk metadata",
+        "embeddings.npy": "vector embeddings",
+        "faiss_index.index": "FAISS index",
+    }
+    missing = False
+    for f, desc in files.items():
+        exists = os.path.exists(f)
+        size = os.path.getsize(f) if exists else 0
+        st.write(f"- **{f}** ({desc}):", "✅" if exists else "❌", f"({size/1024/1024:.2f} MB)")
+        if not exists or size == 0:
+            missing = True
+
+    if not missing:
+        # 3) JSON lengths
+        try:
+            chunks = json.load(open("chunks.json","r",encoding="utf-8"))
+            sources = json.load(open("sources.json","r",encoding="utf-8"))
+            st.write(f"chunks: {len(chunks)}  |  sources: {len(sources)}", "✅" if len(chunks)==len(sources) else "⚠️ lengths differ")
+        except Exception as e:
+            st.error(f"JSON read error: {e}")
+
+        # 4) Embeddings + FAISS shape check
+        try:
+            emb = np.load("embeddings.npy")
+            st.write("embeddings.npy dtype:", str(emb.dtype))
+            st.write("embeddings.npy shape:", str(emb.shape))
+            try:
+                idx = faiss.read_index("faiss_index.index")
+                st.write("faiss index dim:", idx.d)
+                if emb.shape[1] != idx.d:
+                    st.error(f"Dimension mismatch: embeddings dim {emb.shape[1]} vs index dim {idx.d}")
+                else:
+                    st.write("Dimension check:", "✅")
+            except Exception as e:
+                st.error(f"FAISS index read error: {e}")
+        except Exception as e:
+            st.error(f"Embeddings load error: {e}")
+
+# ---------- Main ----------
 if not ai_pipeline:
     st.error(
         "**Fatal Error:** The AI core failed to initialize. "
-        "This is likely due to a missing model, data file, or API key. "
-        "Please check the server logs for more details."
+        "This is likely due to a missing model, data file, or API key."
     )
+    if st.button("Run quick diagnostics"):
+        run_diagnostics()
 else:
     st.markdown(
         "Ask a technical question about an elevator system. "
         "If you know the **Brand** or **Type**, select them to get more accurate results."
     )
 
-    # --- Filter Selection ---
     col1, col2 = st.columns(2)
-    
-    # Create lists for dropdowns, ensuring 'any' is the default and 'unknown' is excluded.
     brand_options = ["any"] + [b for b in ALL_BRANDS if b != "unknown"]
-    type_options = ["any"] + [t for t in ALL_TYPES if t != "unknown"]
-
+    type_options  = ["any"] + [t for t in ALL_TYPES if t != "unknown"]
     brand = col1.selectbox("Select Brand (optional)", brand_options)
     etype = col2.selectbox("Select Type (optional)", type_options)
 
-    # --- User Query Input ---
     query = st.text_input("Enter your question here:", placeholder="e.g., What is the procedure for a brake test?")
 
     if query:
-        # Convert 'any' from the UI to None for the backend logic.
         brand_filter = None if brand == "any" else brand
         etype_filter = None if etype == "any" else etype
 
         with st.spinner("Searching manuals and consulting the AI..."):
             try:
-                # Call the pipeline's main method.
-                answer = ai_pipeline.ask(
-                    query,
-                    brand=brand_filter,
-                    etype=etype_filter
-                )
-
-                # --- Display Results ---
+                answer = ai_pipeline.ask(query, brand=brand_filter, etype=etype_filter)
                 st.divider()
                 st.subheader("AI Assistant's Answer")
-
-                # Display the scope that was used for the search.
-                scope_text = f"**Scope:** `{brand}` / `{etype}`"
-                st.caption(scope_text)
-
+                st.caption(f"**Scope:** `{brand}` / `{etype}`")
                 st.markdown(answer)
-
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")
-
