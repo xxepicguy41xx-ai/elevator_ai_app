@@ -2,7 +2,7 @@
 import os
 import json
 import logging
-from typing import List, Tuple, Optional, Dict
+from typing import List, Optional, Dict
 
 import numpy as np
 import faiss
@@ -19,8 +19,8 @@ EMBEDDINGS_PATH = "embeddings.npy"
 FAISS_INDEX_PATH = "faiss_index.index"
 
 # ---------------- Models ----------------
-EMBEDDING_MODEL = "hkunlp/instructor-base"   # good recall; keep your existing embeddings
-GROQ_MODEL = "openai/gpt-oss-120b"           # stronger, richer answers
+EMBEDDING_MODEL = "hkunlp/instructor-base"   # keeps compatibility with your existing embeddings
+GROQ_MODEL = "openai/gpt-oss-120b"           # richer answers via Groq
 
 # ---------------- Brand aliases ----------------
 BRAND_MAP = {
@@ -37,16 +37,43 @@ def infer_brand_from_name(name: str) -> str:
             return v
     return "unknown"
 
+def get_groq_api_key() -> Optional[str]:
+    """
+    Prefer Streamlit secrets if available; fall back to environment variable.
+    Works on Streamlit Cloud and local dev.
+    """
+    # Try Streamlit secrets
+    try:
+        import streamlit as st
+        key = st.secrets.get("GROQ_API_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+    # Fallback to env var
+    return os.getenv("GROQ_API_KEY")
+
 class ElevatorAIPipeline:
     """
-    Simple RAG pipeline with brand-only filtering and a rich prompt.
+    Simple RAG pipeline with brand-only filtering and a rich prompt that
+    allows tables, lists, and detailed step-by-step guidance.
     """
 
     def __init__(self):
         # --- Load data ---
+        if not os.path.exists(CHUNKS_PATH) or not os.path.exists(SOURCES_PATH):
+            raise RuntimeError("Missing chunks.json or sources.json")
+        if not os.path.exists(EMBEDDINGS_PATH) or not os.path.exists(FAISS_INDEX_PATH):
+            raise RuntimeError("Missing embeddings.npy or faiss_index.index")
+
         self.chunks: List[str] = json.load(open(CHUNKS_PATH, "r", encoding="utf-8"))
         self.sources: List[Dict] = json.load(open(SOURCES_PATH, "r", encoding="utf-8"))
-        self.embeddings: np.ndarray = np.load(EMBEDDINGS_PATH).astype("float32")
+
+        emb = np.load(EMBEDDINGS_PATH)
+        if emb.dtype != np.float32:
+            emb = emb.astype("float32")
+        self.embeddings: np.ndarray = emb
+
         self.index = faiss.read_index(FAISS_INDEX_PATH)
         if self.index.d != self.embeddings.shape[1]:
             raise RuntimeError(f"FAISS dim {self.index.d} != embeddings dim {self.embeddings.shape[1]}")
@@ -60,10 +87,13 @@ class ElevatorAIPipeline:
 
         # --- Encoder & Groq ---
         self.encoder = SentenceTransformer(EMBEDDING_MODEL)
-        api_key = os.getenv("GROQ_API_KEY")
+
+        api_key = get_groq_api_key()
         if not api_key:
-            raise RuntimeError("Missing GROQ_API_KEY.")
+            raise RuntimeError("GROQ_API_KEY not found. Add it to .streamlit/secrets.toml or set an environment variable.")
         self.client = Groq(api_key=api_key)
+
+        logging.info("ElevatorAIPipeline initialized.")
 
     # --------- Retrieval (brand-only filter) ---------
     def search(self, query: str, brand: Optional[str] = None, k: int = 5, pool: int = 60) -> List[int]:
@@ -72,10 +102,9 @@ class ElevatorAIPipeline:
         cand = I[0]
 
         if brand:
-            cand = np.array([i for i in cand if self.sources[int(i)].get("brand") == brand], dtype=int)
-            if len(cand) == 0:
-                # fallback to unfiltered if nothing matched
-                cand = I[0]
+            filtered = [i for i in cand if self.sources[int(i)].get("brand") == brand]
+            if filtered:
+                cand = np.array(filtered, dtype=int)
 
         return [int(i) for i in cand[:k]]
 
@@ -102,7 +131,6 @@ class ElevatorAIPipeline:
             "You may use bullet lists, numbered steps, and **Markdown tables** to organize the answer."
         )
 
-        # Rich, but not overbearing. Encourages depth and structure.
         user = (
             f"{brand_line}\n\n"
             "Using the excerpts below, produce a comprehensive troubleshooting and fix guide. Include:\n"
